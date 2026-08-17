@@ -298,6 +298,10 @@ export interface WhatsAppConfig {
    * inbound attachments expire. Migration 039.
    */
   mirror_inbound_media?: boolean;
+  /** UAZAPI instance token (encrypted at rest, same mechanism as access_token). */
+  uazapi_instance_token?: string;
+  uazapi_instance_id?: string;
+  uazapi_status?: 'disconnected' | 'connecting' | 'connected';
 }
 
 // Raw Meta status enum. We persist this verbatim from Meta (sync + webhook)

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { hashUazapiToken } from '@/lib/whatsapp/uazapi-webhook-auth'
 
 // Shared, hoisted state the module mocks close over. Reset per test.
 const h = vi.hoisted(() => ({
@@ -11,24 +12,21 @@ const h = vi.hoisted(() => ({
     // returns the row; a replayed delivery conflicts and returns [].
     messageUpsertResult: [{ id: 'msg-1' }] as { id: string }[],
     priorCustomerMsgCount: 0,
-    /** Row `lookupInternalIdByMetaId` resolves for a `context.id`. */
-    replyContextParent: null as { id: string } | null,
+    /**
+     * SHA-256 of the UAZAPI instance token stored on the single
+     * whatsapp_config row the mocked DB knows about. The config lookup
+     * filters on it exactly as the real `.eq(...)` would, so a payload
+     * carrying any other token resolves to zero rows.
+     */
+    uazapiTokenHash: null as string | null,
     conversation: { id: 'conv-1', unread_count: 0, account_id: 'acc-1' },
+    /** Rows written by findOrCreateContact's name refresh. */
+    contactUpdates: [] as Record<string, unknown>[],
     upsertCalls: [] as { row: Record<string, unknown>; options: unknown }[],
     rpcCalls: [] as { name: string; args: Record<string, unknown> }[],
     afterCallbacks: [] as (() => Promise<void> | void)[],
     automationStarted: 0,
     automationCompleted: 0,
-    /** whatsapp_config.mirror_inbound_media for the matched row (#466). */
-    mirrorInboundMedia: true as boolean | undefined,
-    /** Objects the inbound-media mirror pushed into chat-media. */
-    storageUploads: [] as {
-      bucket: string
-      path: string
-      options: { contentType?: string }
-    }[],
-    /** Error the next storage upload resolves with, if any. */
-    storageUploadError: null as { message: string } | null,
   },
 }))
 
@@ -48,19 +46,32 @@ vi.mock('@supabase/supabase-js', () => ({
         case 'whatsapp_config':
           return {
             select: () => ({
-              eq: () =>
+              // select('*').eq('uazapi_instance_token_hash', hash)
+              eq: (_column: string, value: string) =>
                 Promise.resolve({
-                  data: [
-                    {
-                      account_id: 'acc-1',
-                      user_id: 'user-1',
-                      access_token: 'enc',
-                      mirror_inbound_media: h.state.mirrorInboundMedia,
-                    },
-                  ],
+                  data:
+                    h.state.uazapiTokenHash && h.state.uazapiTokenHash === value
+                      ? [
+                          {
+                            id: 'cfg-1',
+                            account_id: 'acc-1',
+                            user_id: 'user-1',
+                            uazapi_instance_token_hash: h.state.uazapiTokenHash,
+                          },
+                        ]
+                      : [],
                   error: null,
                 }),
             }),
+          }
+        case 'contacts':
+          // findOrCreateContact refreshes the stored name when the
+          // sender's WhatsApp profile name changed: update().eq()
+          return {
+            update: (row: Record<string, unknown>) => {
+              h.state.contactUpdates.push(row)
+              return { eq: () => Promise.resolve({ data: null, error: null }) }
+            },
           }
         case 'conversations':
           // findOrCreateConversation: select().eq().eq().order().limit()
@@ -97,33 +108,16 @@ vi.mock('@supabase/supabase-js', () => ({
           }
         case 'messages':
           return {
-            // Two different chains land here, told apart by the count
-            // option: the prior-message count (head request) and the
-            // reply-context parent lookup.
-            select: (_columns: string, options?: { head?: boolean }) =>
-              options?.head
-                ? // priorCustomerMsgCount: select('id',{count,head}).eq().eq()
-                  {
-                    eq: () => ({
-                      eq: () =>
-                        Promise.resolve({
-                          count: h.state.priorCustomerMsgCount,
-                          error: null,
-                        }),
-                    }),
-                  }
-                : // lookupInternalIdByMetaId: select('id').eq().eq().maybeSingle()
-                  {
-                    eq: () => ({
-                      eq: () => ({
-                        maybeSingle: () =>
-                          Promise.resolve({
-                            data: h.state.replyContextParent,
-                            error: null,
-                          }),
-                      }),
-                    }),
-                  },
+            // priorCustomerMsgCount: select('id',{count,head}).eq().eq()
+            select: () => ({
+              eq: () => ({
+                eq: () =>
+                  Promise.resolve({
+                    count: h.state.priorCustomerMsgCount,
+                    error: null,
+                  }),
+              }),
+            }),
             // Idempotent insert: upsert(...).select('id')
             upsert: (row: Record<string, unknown>, options: unknown) => {
               h.state.upsertCalls.push({ row, options })
@@ -144,36 +138,9 @@ vi.mock('@supabase/supabase-js', () => ({
       h.state.rpcCalls.push({ name, args })
       return Promise.resolve({ data: null, error: null })
     },
-    // Service-role Storage, used by the inbound-media mirror (#466).
-    storage: {
-      from(bucket: string) {
-        return {
-          upload: (
-            path: string,
-            _body: unknown,
-            options: { contentType?: string },
-          ) => {
-            h.state.storageUploads.push({ bucket, path, options })
-            return Promise.resolve({ error: h.state.storageUploadError })
-          },
-          getPublicUrl: (path: string) => ({
-            data: { publicUrl: `https://cdn.test/${bucket}/${path}` },
-          }),
-        }
-      },
-    },
   }),
 }))
 
-vi.mock('@/lib/whatsapp/encryption', () => ({
-  decrypt: () => 'plain-token',
-  encrypt: (v: string) => v,
-  isLegacyFormat: () => false,
-}))
-vi.mock('@/lib/whatsapp/meta-api', () => ({
-  getMediaUrl: vi.fn(),
-  downloadMedia: vi.fn(),
-}))
 vi.mock('@/lib/contacts/dedupe', () => ({
   findExistingContact: vi.fn(async () => ({
     id: 'contact-1',
@@ -182,12 +149,8 @@ vi.mock('@/lib/contacts/dedupe', () => ({
   })),
   isUniqueViolation: () => false,
 }))
-vi.mock('@/lib/whatsapp/webhook-signature', () => ({
-  verifyMetaWebhookSignature: () => true,
-}))
-vi.mock('@/lib/whatsapp/template-webhook', () => ({
-  isTemplateWebhookField: () => false,
-  handleTemplateWebhookChange: vi.fn(),
+vi.mock('@/lib/conversations/reopen', () => ({
+  reopenClosedConversation: vi.fn(async () => undefined),
 }))
 vi.mock('@/lib/automations/engine', () => ({
   runAutomationsForTrigger: h.runAutomationsForTrigger,
@@ -203,44 +166,61 @@ vi.mock('@/lib/webhooks/deliver', () => ({
 }))
 
 import { POST } from './route'
-import { getMediaUrl, downloadMedia } from '@/lib/whatsapp/meta-api'
 
-const mockGetMediaUrl = vi.mocked(getMediaUrl)
-const mockDownloadMedia = vi.mocked(downloadMedia)
-
-const TEXT_MESSAGE = {
-  id: 'wamid.TEST1',
-  from: '15551230000',
-  timestamp: '1700000000',
-  type: 'text',
-  text: { body: 'hello' },
-}
-
-function inboundRequest(message: Record<string, unknown> = TEXT_MESSAGE) {
-  const body = {
-    entry: [
-      {
-        changes: [
-          {
-            field: 'messages',
-            value: {
-              metadata: { phone_number_id: 'pn-1' },
-              contacts: [{ wa_id: '15551230000', profile: { name: 'Ada' } }],
-              messages: [message],
-            },
-          },
-        ],
-      },
-    ],
-  }
+/**
+ * One UAZAPI `messages` event, exactly as the provider POSTs it: a
+ * single message per HTTP request, with the instance token in cleartext
+ * at the root of the body.
+ */
+function uazapiTextPayload(
+  overrides?: Partial<{
+    text: string
+    senderPn: string
+    fromMe: boolean
+    wasSentByApi: boolean
+    messageid: string
+    chatid: string
+    isGroup: boolean
+    type: string
+    EventType: string
+  }>,
+) {
   return {
-    text: async () => JSON.stringify(body),
-    headers: { get: () => 'sha256=stub' },
-  } as unknown as Request
+    EventType: overrides?.EventType ?? 'messages',
+    token: 'tok-123',
+    instanceName: 'BRB WACRM',
+    message: {
+      chatid: overrides?.chatid ?? '5519999353218@s.whatsapp.net',
+      messageid: overrides?.messageid ?? 'A5D6F48B790E9AD6A3BD05FF75BCCCC4',
+      fromMe: overrides?.fromMe ?? false,
+      isGroup: overrides?.isGroup ?? false,
+      messageType: 'Conversation',
+      type: overrides?.type ?? 'text',
+      text: overrides?.text ?? 'Oi',
+      messageTimestamp: 1786970871000,
+      sender_pn: overrides?.senderPn ?? '5519999353218@s.whatsapp.net',
+      senderName: 'BRB Agência Digital',
+      wasSentByApi: overrides?.wasSentByApi ?? false,
+    },
+  }
 }
 
-async function runWebhook(message?: Record<string, unknown>) {
-  const res = await POST(inboundRequest(message))
+/**
+ * The mocked `NextResponse.json` returns a plain `{ body, init }` pair
+ * rather than a real Response, so assertions read the status off `init`.
+ * POST's declared return type is NextResponse — cast once, here.
+ */
+type MockedResponse = { body: unknown; init?: { status?: number } }
+
+async function postWebhook(body: unknown): Promise<MockedResponse> {
+  const res = await POST(
+    new Request('http://x', { method: 'POST', body: JSON.stringify(body) }),
+  )
+  return res as unknown as MockedResponse
+}
+
+async function runWebhook(overrides?: Parameters<typeof uazapiTextPayload>[0]) {
+  const res = await postWebhook(uazapiTextPayload(overrides))
   // Drain the after() callback exactly as the runtime would.
   for (const cb of h.state.afterCallbacks) await cb()
   return res
@@ -250,25 +230,14 @@ beforeEach(() => {
   vi.clearAllMocks()
   h.state.messageUpsertResult = [{ id: 'msg-1' }]
   h.state.priorCustomerMsgCount = 0
-  h.state.replyContextParent = null
+  h.state.uazapiTokenHash = hashUazapiToken('tok-123')
   h.state.conversation = { id: 'conv-1', unread_count: 0, account_id: 'acc-1' }
+  h.state.contactUpdates = []
   h.state.upsertCalls = []
   h.state.rpcCalls = []
   h.state.afterCallbacks = []
   h.state.automationStarted = 0
   h.state.automationCompleted = 0
-  h.state.mirrorInboundMedia = true
-  h.state.storageUploads = []
-  h.state.storageUploadError = null
-  mockGetMediaUrl.mockResolvedValue({
-    url: 'https://lookaside.fbsbx.com/whatsapp/abc',
-    mimeType: 'image/jpeg',
-    fileSize: 2048,
-  })
-  mockDownloadMedia.mockResolvedValue({
-    buffer: Buffer.alloc(2048),
-    contentType: 'image/jpeg',
-  })
   h.dispatchInboundToFlows.mockResolvedValue({ consumed: false })
   h.dispatchInboundToAiReply.mockResolvedValue(undefined)
   h.dispatchWebhookEvent.mockResolvedValue(undefined)
@@ -280,6 +249,101 @@ beforeEach(() => {
         resolve()
       }, 0)
     })
+  })
+})
+
+describe('POST /api/whatsapp/webhook — UAZAPI', () => {
+  it('accepts a payload whose token hash matches a configured account', async () => {
+    h.state.uazapiTokenHash = hashUazapiToken('tok-123')
+    const response = await postWebhook(uazapiTextPayload())
+    expect(response.init?.status ?? 200).toBe(200)
+    for (const cb of h.state.afterCallbacks) await cb()
+    expect(h.state.upsertCalls.at(-1)?.row).toMatchObject({
+      sender_type: 'customer',
+      content_type: 'text',
+      content_text: 'Oi',
+      message_id: 'A5D6F48B790E9AD6A3BD05FF75BCCCC4',
+    })
+  })
+
+  it('rejects a payload whose token does not match any account', async () => {
+    h.state.uazapiTokenHash = hashUazapiToken('a-different-token')
+    const response = await postWebhook(uazapiTextPayload())
+    expect(response.init?.status).toBe(401)
+  })
+
+  it('rejects a payload with no token at all', async () => {
+    const body = uazapiTextPayload() as Record<string, unknown>
+    delete body.token
+    const response = await postWebhook(body)
+    expect(response.init?.status).toBe(401)
+  })
+
+  it('ignores events that are echoes of our own API-sent messages', async () => {
+    const response = await runWebhook({ fromMe: true, wasSentByApi: true })
+    expect(response.body).toMatchObject({ status: 'ignored' })
+    expect(h.state.upsertCalls.length).toBe(0)
+  })
+
+  it('ignores messages the owner typed on the phone itself', async () => {
+    // fromMe with wasSentByApi:false — not an API echo, so the
+    // idempotent upsert would NOT have caught it. Stored as a customer
+    // message it would bump unread and trigger the AI auto-reply,
+    // i.e. the CRM answering itself.
+    const response = await runWebhook({ fromMe: true, wasSentByApi: false })
+    expect(response.body).toMatchObject({ status: 'ignored' })
+    expect(h.state.upsertCalls.length).toBe(0)
+    expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
+  })
+
+  it('ignores group messages', async () => {
+    // The group jid is not a phone number, but normalizePhone cannot
+    // tell — processing it would mint a phantom contact.
+    const response = await runWebhook({
+      isGroup: true,
+      chatid: '120363123456789012@g.us',
+    })
+    expect(response.body).toMatchObject({ status: 'ignored' })
+    expect(h.state.upsertCalls.length).toBe(0)
+  })
+
+  it('ignores an event with no messageid, which would break idempotency', async () => {
+    // A NULL message_id never conflicts on the unique index, so every
+    // retry of this delivery would insert again and replay the fan-out.
+    const response = await runWebhook({ messageid: '' })
+    expect(response.body).toMatchObject({ status: 'ignored' })
+    expect(h.state.upsertCalls.length).toBe(0)
+  })
+
+  it('ignores non-message events', async () => {
+    const response = await runWebhook({ EventType: 'connection' })
+    expect(response.init?.status).toBe(200)
+    expect(response.body).toMatchObject({ status: 'ignored' })
+    expect(h.state.upsertCalls.length).toBe(0)
+  })
+
+  it('ignores message types other than text (out of scope this phase)', async () => {
+    const response = await runWebhook({ type: 'image' })
+    expect(response.init?.status).toBe(200)
+    expect(response.body).toMatchObject({ status: 'ignored' })
+    expect(h.state.upsertCalls.length).toBe(0)
+  })
+
+  it('routes the inbound text to flows with the provider message id', async () => {
+    await runWebhook()
+
+    expect(h.dispatchInboundToFlows).toHaveBeenCalledWith(
+      expect.objectContaining({
+        accountId: 'acc-1',
+        conversationId: 'conv-1',
+        contactId: 'contact-1',
+        message: {
+          kind: 'text',
+          text: 'Oi',
+          meta_message_id: 'A5D6F48B790E9AD6A3BD05FF75BCCCC4',
+        },
+      }),
+    )
   })
 })
 
@@ -325,205 +389,6 @@ describe('inbound webhook: atomic unread bump (#369)', () => {
       name: 'bump_conversation_on_inbound',
       args: { p_conversation_id: 'conv-1' },
     })
-  })
-})
-
-describe('inbound webhook: template quick-reply buttons (#478)', () => {
-  // A customer tapping a QUICK_REPLY button on a broadcast template.
-  // `context.id` points at the template message we sent — which the
-  // broadcast path never wrote to `messages`, so the parent lookup
-  // legitimately misses and the reply is stored unquoted.
-  const templateButtonTap = {
-    id: 'wamid.BTN1',
-    from: '15551230000',
-    timestamp: '1700000000',
-    type: 'button',
-    button: { text: 'Yes, interested', payload: 'YES_INTERESTED' },
-    context: { id: 'wamid.BROADCAST1' },
-  }
-
-  it('stores the tap as an interactive reply, not an unsupported message', async () => {
-    await runWebhook(templateButtonTap)
-
-    expect(h.state.upsertCalls).toHaveLength(1)
-    expect(h.state.upsertCalls[0].row).toMatchObject({
-      content_type: 'interactive',
-      content_text: 'Yes, interested',
-      interactive_reply_id: 'YES_INTERESTED',
-      reply_to_message_id: null,
-    })
-  })
-
-  it('routes the tap to flows and fires the interactive_reply trigger', async () => {
-    await runWebhook(templateButtonTap)
-
-    expect(h.dispatchInboundToFlows).toHaveBeenCalledWith(
-      expect.objectContaining({
-        message: {
-          kind: 'interactive_reply',
-          reply_id: 'YES_INTERESTED',
-          reply_title: 'Yes, interested',
-          meta_message_id: 'wamid.BTN1',
-        },
-      }),
-    )
-    const triggers = h.runAutomationsForTrigger.mock.calls.map(
-      (call) => (call[0] as { triggerType: string }).triggerType,
-    )
-    expect(triggers).toContain('interactive_reply')
-    // The AI auto-reply must stay out of it — a button tap is not a
-    // free-text question.
-    expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
-  })
-
-  it('falls back to the label when the template button carries no payload', async () => {
-    await runWebhook({
-      ...templateButtonTap,
-      button: { text: 'Track my order' },
-    })
-
-    expect(h.state.upsertCalls[0].row).toMatchObject({
-      content_type: 'interactive',
-      content_text: 'Track my order',
-      interactive_reply_id: 'Track my order',
-    })
-  })
-})
-
-describe('inbound webhook: inbound media is mirrored (#466)', () => {
-  const IMAGE_MESSAGE = {
-    id: 'wamid.IMG1',
-    from: '15551230000',
-    timestamp: '1700000000',
-    type: 'image',
-    image: { id: '1234567890123456', mime_type: 'image/jpeg', caption: 'hi' },
-  }
-
-  it('stores a durable bucket URL instead of the expiring proxy path', async () => {
-    await runWebhook(IMAGE_MESSAGE)
-
-    expect(h.state.storageUploads).toHaveLength(1)
-    expect(h.state.storageUploads[0].bucket).toBe('chat-media')
-    expect(h.state.storageUploads[0].path).toBe(
-      'account-acc-1/inbound/1234567890123456-image-1700000000.jpg',
-    )
-    expect(h.state.upsertCalls[0].row).toMatchObject({
-      media_url:
-        'https://cdn.test/chat-media/account-acc-1/inbound/1234567890123456-image-1700000000.jpg',
-      // Meta's MIME type used to be discarded outright (`void mediaType`).
-      media_type: 'image/jpeg',
-    })
-  })
-
-  it('falls back to the proxy URL when the upload is refused', async () => {
-    h.state.storageUploadError = { message: 'mime type not supported' }
-
-    await runWebhook(IMAGE_MESSAGE)
-
-    // The message still lands, and it still lands with a usable URL —
-    // the mirror failing must never cost us the message.
-    expect(h.state.upsertCalls).toHaveLength(1)
-    expect(h.state.upsertCalls[0].row).toMatchObject({
-      media_url: '/api/whatsapp/media/1234567890123456',
-      media_type: 'image/jpeg',
-    })
-  })
-
-  it('falls back to the proxy URL when the download from Meta throws', async () => {
-    mockDownloadMedia.mockRejectedValueOnce(new Error('Media download failed: 404'))
-
-    await runWebhook(IMAGE_MESSAGE)
-
-    expect(h.state.upsertCalls[0].row).toMatchObject({
-      media_url: '/api/whatsapp/media/1234567890123456',
-    })
-  })
-
-  it('skips media larger than the bucket accepts, without downloading it', async () => {
-    mockGetMediaUrl.mockResolvedValue({
-      url: 'https://lookaside.fbsbx.com/whatsapp/big',
-      mimeType: 'application/pdf',
-      fileSize: 40 * 1024 * 1024,
-    })
-
-    await runWebhook({
-      id: 'wamid.DOC1',
-      from: '15551230000',
-      timestamp: '1700000000',
-      type: 'document',
-      document: {
-        id: '999',
-        mime_type: 'application/pdf',
-        filename: 'huge.pdf',
-      },
-    })
-
-    expect(mockDownloadMedia).not.toHaveBeenCalled()
-    expect(h.state.storageUploads).toHaveLength(0)
-    expect(h.state.upsertCalls[0].row).toMatchObject({
-      media_url: '/api/whatsapp/media/999',
-      media_type: 'application/pdf',
-    })
-  })
-
-  it("names the object after a document's own filename", async () => {
-    mockGetMediaUrl.mockResolvedValue({
-      url: 'https://lookaside.fbsbx.com/whatsapp/doc',
-      mimeType: 'application/pdf',
-      fileSize: 4096,
-    })
-    mockDownloadMedia.mockResolvedValue({
-      buffer: Buffer.alloc(4096),
-      contentType: 'application/pdf',
-    })
-
-    await runWebhook({
-      id: 'wamid.DOC2',
-      from: '15551230000',
-      timestamp: '1700000000',
-      type: 'document',
-      document: {
-        id: '1234567890123456',
-        mime_type: 'application/pdf',
-        filename: 'invoice.pdf',
-        caption: 'have a look',
-      },
-    })
-
-    expect(h.state.storageUploads[0].path).toBe(
-      'account-acc-1/inbound/1234567890123456-invoice.pdf',
-    )
-  })
-
-  it('does not mirror when the account has opted out', async () => {
-    h.state.mirrorInboundMedia = false
-
-    await runWebhook(IMAGE_MESSAGE)
-
-    expect(mockDownloadMedia).not.toHaveBeenCalled()
-    expect(h.state.storageUploads).toHaveLength(0)
-    expect(h.state.upsertCalls[0].row).toMatchObject({
-      media_url: '/api/whatsapp/media/1234567890123456',
-      // Still recorded — the MIME type costs nothing and makes the
-      // download name right even for proxied media.
-      media_type: 'image/jpeg',
-    })
-  })
-
-  it('mirrors when the column is absent, e.g. a row read before migration 039', async () => {
-    h.state.mirrorInboundMedia = undefined
-
-    await runWebhook(IMAGE_MESSAGE)
-
-    expect(h.state.storageUploads).toHaveLength(1)
-  })
-
-  it('leaves text messages alone', async () => {
-    await runWebhook()
-
-    expect(mockGetMediaUrl).not.toHaveBeenCalled()
-    expect(h.state.storageUploads).toHaveLength(0)
-    expect(h.state.upsertCalls[0].row).toMatchObject({ media_type: null })
   })
 })
 

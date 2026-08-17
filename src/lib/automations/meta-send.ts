@@ -1,4 +1,5 @@
-import { sendTextMessage, sendTemplateMessage } from '@/lib/whatsapp/meta-api'
+import { sendTemplateMessage } from '@/lib/whatsapp/meta-api'
+import { sendText } from '@/lib/whatsapp/uazapi-client'
 import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive'
 import {
   engineSendInteractiveButtons,
@@ -144,7 +145,18 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
     throw new Error('WhatsApp not configured for this account')
   }
 
-  const accessToken = decrypt(config.access_token)
+  // Text sends go through UAZAPI (Fase 1); template sends are still
+  // Meta-only. Decrypt only the credential the branch actually needs —
+  // a UAZAPI-only account has no Meta access_token at all (the column is
+  // nullable as of migration 041).
+  const accessToken = input.kind === 'template' ? decrypt(config.access_token) : ''
+  let instanceToken = ''
+  if (input.kind === 'text') {
+    if (!config.uazapi_instance_token) {
+      throw new Error('WhatsApp (UAZAPI) not configured for this account')
+    }
+    instanceToken = decrypt(config.uazapi_instance_token)
+  }
 
   // Local template row — read for the body we persist below, not for
   // the Meta payload (the wire shape is deliberately unchanged here).
@@ -174,10 +186,9 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
       })
       return r.messageId
     }
-    const r = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
+    const r = await sendText({
+      instanceToken,
+      number: phone,
       text: input.text,
     })
     return r.messageId

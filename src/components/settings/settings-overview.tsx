@@ -123,14 +123,19 @@ export function SettingsOverview({
       const [row, health] = await Promise.allSettled([
         supabase
           .from('whatsapp_config')
-          .select('phone_number_id')
+          // UAZAPI, not Meta: an account is "configured" once it has an
+          // instance token saved (the hash is the non-secret proof of
+          // one), regardless of whether the QR scan has landed yet —
+          // `connected` below covers the live-session half.
+          .select('uazapi_instance_token_hash')
           .eq('account_id', acctId)
           .maybeSingle(),
         fetch('/api/whatsapp/config', { cache: 'no-store' }).then((r) => r.json()),
       ]);
       if (cancelled) return;
       setWhatsapp({
-        configured: row.status === 'fulfilled' && !!row.value.data?.phone_number_id,
+        configured:
+          row.status === 'fulfilled' && !!row.value.data?.uazapi_instance_token_hash,
         connected: health.status === 'fulfilled' && !!health.value?.connected,
       });
       setWhatsappLoading(false);
