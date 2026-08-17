@@ -2,11 +2,11 @@ import {
   sendInteractiveButtons,
   sendInteractiveList,
   sendMediaMessage,
-  sendTextMessage,
   type InteractiveButton,
   type InteractiveListSection,
   type MediaKind,
 } from '@/lib/whatsapp/meta-api'
+import { sendText } from '@/lib/whatsapp/uazapi-client'
 import type { InteractiveMessagePayload } from '@/lib/whatsapp/interactive'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import {
@@ -91,13 +91,15 @@ export async function engineSendText(
     throw new Error('WhatsApp not configured for this account')
   }
 
-  const accessToken = decrypt(config.access_token)
+  if (!config.uazapi_instance_token) {
+    throw new Error('WhatsApp (UAZAPI) not configured for this account')
+  }
+  const instanceToken = decrypt(config.uazapi_instance_token)
 
   const attempt = async (phone: string): Promise<string> => {
-    const r = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
+    const r = await sendText({
+      instanceToken,
+      number: phone,
       text: args.text,
     })
     return r.messageId
