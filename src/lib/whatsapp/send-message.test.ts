@@ -6,6 +6,7 @@ import {
   SendMessageError,
   type SendMessageParams,
 } from './send-message';
+import { encrypt } from './encryption';
 
 // A db that explodes if touched — these tests cover the param
 // validation that MUST short-circuit before any query runs.
@@ -162,18 +163,16 @@ describe('SendMessageError', () => {
 // Full send path — what actually lands in `messages` (issue #483).
 // ============================================================
 
-const sendTemplateMessage = vi.fn(async () => ({ messageId: 'wamid.1' }));
-
-// Stub only the senders — the module also exports INTERACTIVE_LIMITS,
-// which `interactive.ts` needs for the payload validation covered above.
-vi.mock('@/lib/whatsapp/meta-api', async (importOriginal) => ({
-  ...(await importOriginal<Record<string, unknown>>()),
-  sendTextMessage: vi.fn(async () => ({ messageId: 'wamid.text' })),
-  sendTemplateMessage: (...args: unknown[]) =>
-    (sendTemplateMessage as unknown as (...a: unknown[]) => unknown)(...args),
-  sendMediaMessage: vi.fn(async () => ({ messageId: 'wamid.media' })),
-  sendInteractiveButtons: vi.fn(async () => ({ messageId: 'wamid.btn' })),
-  sendInteractiveList: vi.fn(async () => ({ messageId: 'wamid.list' })),
+vi.mock('@/lib/whatsapp/uazapi-client', () => ({
+  sendText: vi.fn(async () => ({ messageId: 'wamid.text' })),
+  UazapiApiError: class UazapiApiError extends Error {
+    status: number;
+    constructor(message: string, status = 500) {
+      super(message);
+      this.name = 'UazapiApiError';
+      this.status = status;
+    }
+  },
 }));
 
 vi.mock('@/lib/whatsapp/encryption', () => ({
@@ -199,23 +198,26 @@ interface CapturedWrites {
 }
 
 /**
- * Supabase fake covering the tables the send path touches. Each table
- * gets a builder that is both chainable and awaitable, so the same
- * object serves `.single()` lookups and the bare `select().eq().eq()`
- * the template resolver uses.
+ * Supabase fake covering the tables the send path touches (conversation
+ * + contact, whatsapp_config, messages.insert, conversations.update).
+ * Each table gets a builder that is both chainable and awaitable, so
+ * the same object serves `.single()` lookups and the bare
+ * `select().eq().eq()` the template resolver uses.
+ *
+ * `whatsapp_config` returns a UAZAPI-shaped row (`uazapi_instance_token`)
+ * rather than the old Meta fields — this is the happy-path db reused by
+ * both the UAZAPI text-send test and the 501 "not implemented" tests for
+ * the other message types below.
  */
-function sendPathDb(
-  templateRows: unknown[],
-  captured: CapturedWrites
-): SupabaseClient {
+function makeHappyPathDb(captured: CapturedWrites = {}): SupabaseClient {
   const conversation = {
     id: 'cv-1',
     contact: { id: 'ct-1', phone: '+15551234567' },
   };
   const config = {
     id: 'cfg-1',
-    phone_number_id: 'pn-1',
-    access_token: 'token',
+    account_id: 'acct-1',
+    uazapi_instance_token: encrypt('tok-123'),
   };
 
   return {
@@ -244,105 +246,51 @@ function sendPathDb(
         },
         // Bare-await result — only message_templates is read this way.
         then: (resolve: (r: { data: unknown[]; error: null }) => unknown) =>
-          resolve({
-            data: table === 'message_templates' ? templateRows : [],
-            error: null,
-          }),
+          resolve({ data: [], error: null }),
       };
       return builder;
     },
   } as unknown as SupabaseClient;
 }
 
-const TEMPLATE_ROW = {
-  id: 'tpl-1',
-  user_id: 'u-1',
-  name: 'order_update',
-  category: 'Utility',
-  language: 'en',
-  body_text: 'Your order {{1}} ships on {{2}}',
-  created_at: '2026-01-01T00:00:00Z',
-};
+describe('sendMessageToConversation — UAZAPI text send', () => {
+  it('sends text via uazapi-client.sendText and persists the message', async () => {
+    const { sendText } = await import('./uazapi-client');
+    vi.mocked(sendText).mockResolvedValueOnce({ messageId: 'wamid-uaz-1' });
 
-describe('sendMessageToConversation — template persistence (#483)', () => {
-  it('stores the substituted body when the caller sends no text', async () => {
-    const captured: CapturedWrites = {};
-    const result = await sendMessageToConversation(
-      sendPathDb([TEMPLATE_ROW], captured),
-      'acct-1',
-      {
+    const db = makeHappyPathDb();
+
+    const result = await sendMessageToConversation(db, 'acct-1', {
+      conversationId: 'cv-1',
+      messageType: 'text',
+      contentText: 'Oi cliente',
+    });
+
+    expect(sendText).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'Oi cliente' })
+    );
+    expect(result.whatsappMessageId).toBe('wamid-uaz-1');
+  });
+
+  it('rejects template sends with 501 not_implemented', async () => {
+    const db = makeHappyPathDb();
+    await expect(
+      sendMessageToConversation(db, 'acct-1', {
         conversationId: 'cv-1',
         messageType: 'template',
-        templateName: 'order_update',
-        templateParams: ['A123', 'Friday'],
-      }
-    );
-
-    expect(result.whatsappMessageId).toBe('wamid.1');
-    // Was NULL before the fix — the Inbox rendered an empty bubble.
-    expect(captured.message?.content_text).toBe(
-      'Your order A123 ships on Friday'
-    );
-    expect(captured.message?.template_name).toBe('order_update');
-    // …and the conversation-list preview reads the body, not '[template]'.
-    expect(captured.conversation?.last_message_text).toBe(
-      'Your order A123 ships on Friday'
-    );
+        templateName: 'welcome',
+      })
+    ).rejects.toMatchObject({ status: 501, code: 'not_implemented' });
   });
 
-  it('reads body values out of the structured params shape too', async () => {
-    const captured: CapturedWrites = {};
-    await sendMessageToConversation(sendPathDb([TEMPLATE_ROW], captured), 'acct-1', {
-      conversationId: 'cv-1',
-      messageType: 'template',
-      templateName: 'order_update',
-      templateMessageParams: { body: ['B456', 'Monday'] },
-    });
-    expect(captured.message?.content_text).toBe(
-      'Your order B456 ships on Monday'
-    );
-  });
-
-  it("does not override the composer's pre-rendered text", async () => {
-    const captured: CapturedWrites = {};
-    await sendMessageToConversation(sendPathDb([TEMPLATE_ROW], captured), 'acct-1', {
-      conversationId: 'cv-1',
-      messageType: 'template',
-      templateName: 'order_update',
-      templateParams: ['A123', 'Friday'],
-      contentText: 'rendered by the composer',
-    });
-    expect(captured.message?.content_text).toBe('rendered by the composer');
-  });
-
-  it("sends the local row's language when the caller names none", async () => {
-    sendTemplateMessage.mockClear();
-    const captured: CapturedWrites = {};
-    await sendMessageToConversation(sendPathDb([TEMPLATE_ROW], captured), 'acct-1', {
-      conversationId: 'cv-1',
-      messageType: 'template',
-      templateName: 'order_update',
-      templateParams: ['A123', 'Friday'],
-    });
-    // Previously pinned to 'en_US', which matched no row and made Meta
-    // reject the send as a missing translation.
-    expect(
-      (sendTemplateMessage.mock.calls[0] as unknown as [{ language: string }])[0]
-        .language
-    ).toBe('en');
-  });
-
-  it('leaves content_text null when the account has no local template row', async () => {
-    const captured: CapturedWrites = {};
-    await sendMessageToConversation(sendPathDb([], captured), 'acct-1', {
-      conversationId: 'cv-1',
-      messageType: 'template',
-      templateName: 'never_synced',
-      templateParams: ['A123'],
-    });
-    // Nothing to render from — the bubble falls back to the template
-    // name rather than inventing a body.
-    expect(captured.message?.content_text).toBeNull();
-    expect(captured.conversation?.last_message_text).toBe('[template]');
+  it('rejects media sends with 501 not_implemented', async () => {
+    const db = makeHappyPathDb();
+    await expect(
+      sendMessageToConversation(db, 'acct-1', {
+        conversationId: 'cv-1',
+        messageType: 'image',
+        mediaUrl: 'https://x/y.jpg',
+      })
+    ).rejects.toMatchObject({ status: 501, code: 'not_implemented' });
   });
 });

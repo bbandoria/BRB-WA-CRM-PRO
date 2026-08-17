@@ -21,20 +21,13 @@
 
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-import {
-  sendTextMessage,
-  sendTemplateMessage,
-  sendMediaMessage,
-  sendInteractiveButtons,
-  sendInteractiveList,
-  type MediaKind,
-} from '@/lib/whatsapp/meta-api';
+import { sendText, UazapiApiError } from '@/lib/whatsapp/uazapi-client';
 import {
   validateInteractivePayload,
   interactivePayloadPreviewText,
   type InteractiveMessagePayload,
 } from '@/lib/whatsapp/interactive';
-import { decrypt, encrypt, isLegacyFormat } from '@/lib/whatsapp/encryption';
+import { decrypt } from '@/lib/whatsapp/encryption';
 import { supabaseAdmin } from '@/lib/flows/admin-client';
 import {
   sanitizePhoneForMeta,
@@ -219,8 +212,6 @@ export async function sendMessageToConversation(
     interactivePayload,
   });
 
-  const isMediaKind = (MEDIA_KINDS as readonly string[]).includes(messageType);
-
   // Conversation + contact, account-scoped.
   const { data: conversation, error: convError } = await db
     .from('conversations')
@@ -264,24 +255,6 @@ export async function sendMessageToConversation(
       'WhatsApp not configured. Please set up your WhatsApp integration first.',
       400
     );
-  }
-
-  const accessToken = decrypt(config.access_token);
-
-  // Self-heal legacy CBC ciphertexts. Fire-and-forget; idempotent.
-  if (isLegacyFormat(config.access_token)) {
-    void db
-      .from('whatsapp_config')
-      .update({ access_token: encrypt(accessToken) })
-      .eq('id', config.id)
-      .then(({ error }: { error: { message: string } | null }) => {
-        if (error) {
-          console.warn(
-            '[send-message] access_token GCM upgrade failed:',
-            error.message
-          );
-        }
-      });
   }
 
   // Resolve the reply target to its Meta message_id. The parent must
@@ -337,69 +310,35 @@ export async function sendMessageToConversation(
   }
 
   const attempt = async (phone: string): Promise<string> => {
-    if (messageType === 'template') {
-      const result = await sendTemplateMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: phone,
-        templateName: templateName!,
-        language: sendLanguage,
-        template: templateRow ?? undefined,
-        messageParams: templateMessageParams ?? undefined,
-        params: templateParams || [],
-        contextMessageId,
+    if (messageType !== 'text') {
+      throw new SendMessageError(
+        'not_implemented',
+        `Message type "${messageType}" is not yet supported on UAZAPI. Only text messages are supported in this phase.`,
+        501
+      );
+    }
+    try {
+      const result = await sendText({
+        instanceToken: config.uazapi_instance_token
+          ? decrypt(config.uazapi_instance_token)
+          : (() => {
+              throw new SendMessageError(
+                'whatsapp_not_configured',
+                'UAZAPI instance not configured for this account.',
+                400
+              );
+            })(),
+        number: phone,
+        text: contentText!,
       });
       return result.messageId;
-    }
-    if (isMediaKind) {
-      const result = await sendMediaMessage({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: phone,
-        kind: messageType as MediaKind,
-        link: mediaUrl!,
-        caption: contentText || undefined,
-        filename: filename || undefined,
-        contextMessageId,
-      });
-      return result.messageId;
-    }
-    if (messageType === 'interactive') {
-      const p = interactivePayload!;
-      if (p.kind === 'buttons') {
-        const result = await sendInteractiveButtons({
-          phoneNumberId: config.phone_number_id,
-          accessToken,
-          to: phone,
-          bodyText: p.body,
-          headerText: p.header || undefined,
-          footerText: p.footer || undefined,
-          buttons: p.buttons,
-          contextMessageId,
-        });
-        return result.messageId;
+    } catch (err) {
+      if (err instanceof SendMessageError) throw err;
+      if (err instanceof UazapiApiError) {
+        throw new SendMessageError('uazapi_error', err.message, 502);
       }
-      const result = await sendInteractiveList({
-        phoneNumberId: config.phone_number_id,
-        accessToken,
-        to: phone,
-        bodyText: p.body,
-        buttonLabel: p.button_label,
-        headerText: p.header || undefined,
-        footerText: p.footer || undefined,
-        sections: p.sections,
-        contextMessageId,
-      });
-      return result.messageId;
+      throw err;
     }
-    const result = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
-      accessToken,
-      to: phone,
-      text: contentText!,
-      contextMessageId,
-    });
-    return result.messageId;
   };
 
   // Send via Meta — retry across phone-number variants if Meta rejects
@@ -431,6 +370,7 @@ export async function sendMessageToConversation(
 
     if (lastError) throw lastError;
   } catch (err) {
+    if (err instanceof SendMessageError) throw err;
     const message =
       err instanceof Error ? err.message : 'Unknown Meta API error';
     console.error('[send-message] Meta send failed for all variants:', message);
