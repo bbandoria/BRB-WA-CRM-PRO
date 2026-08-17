@@ -54,8 +54,12 @@ describe('POST /api/whatsapp/uazapi/connect', () => {
 
     const { POST } = await import('./route')
     const response = await POST(
+      // The Host header matters: the route refuses to register a
+      // relative/unresolvable webhook URL with UAZAPI, so a fixture
+      // request has to look like a real one.
       new Request('http://x', {
         method: 'POST',
+        headers: { host: 'app.example.com' },
         body: JSON.stringify({ instance_token: 'tok-123' }),
       })
     )
