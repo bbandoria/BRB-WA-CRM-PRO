@@ -225,6 +225,13 @@ async function processInboundText(
   // insert — an empty result means this delivery was a replay. This is
   // the single idempotency boundary, and it must sit BEFORE the unread
   // bump and all downstream fan-out below (issue #367).
+  // messageTimestamp arrives in milliseconds from UAZAPI, but the
+  // underlying WhatsApp protocol timestamps are seconds and some
+  // provider builds pass them straight through. 1e12 ms is 2001-09-09,
+  // so anything below that threshold can only be a seconds value.
+  const ts = message.messageTimestamp
+  const createdAt = new Date(ts < 1e12 ? ts * 1000 : ts).toISOString()
+
   const { data: insertedRows, error: msgError } = await supabaseAdmin()
     .from('messages')
     .upsert(
@@ -235,7 +242,7 @@ async function processInboundText(
         content_text: contentText,
         message_id: message.messageid,
         status: 'delivered',
-        created_at: new Date(message.messageTimestamp).toISOString(),
+        created_at: createdAt,
       },
       { onConflict: 'conversation_id,message_id', ignoreDuplicates: true }
     )
