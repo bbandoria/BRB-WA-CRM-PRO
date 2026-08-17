@@ -179,6 +179,8 @@ function uazapiTextPayload(
     fromMe: boolean
     wasSentByApi: boolean
     messageid: string
+    chatid: string
+    isGroup: boolean
     type: string
     EventType: string
   }>,
@@ -188,10 +190,10 @@ function uazapiTextPayload(
     token: 'tok-123',
     instanceName: 'BRB WACRM',
     message: {
-      chatid: '5519999353218@s.whatsapp.net',
+      chatid: overrides?.chatid ?? '5519999353218@s.whatsapp.net',
       messageid: overrides?.messageid ?? 'A5D6F48B790E9AD6A3BD05FF75BCCCC4',
       fromMe: overrides?.fromMe ?? false,
-      isGroup: false,
+      isGroup: overrides?.isGroup ?? false,
       messageType: 'Conversation',
       type: overrides?.type ?? 'text',
       text: overrides?.text ?? 'Oi',
@@ -278,7 +280,38 @@ describe('POST /api/whatsapp/webhook — UAZAPI', () => {
   })
 
   it('ignores events that are echoes of our own API-sent messages', async () => {
-    await runWebhook({ fromMe: true, wasSentByApi: true })
+    const response = await runWebhook({ fromMe: true, wasSentByApi: true })
+    expect(response.body).toMatchObject({ status: 'ignored' })
+    expect(h.state.upsertCalls.length).toBe(0)
+  })
+
+  it('ignores messages the owner typed on the phone itself', async () => {
+    // fromMe with wasSentByApi:false — not an API echo, so the
+    // idempotent upsert would NOT have caught it. Stored as a customer
+    // message it would bump unread and trigger the AI auto-reply,
+    // i.e. the CRM answering itself.
+    const response = await runWebhook({ fromMe: true, wasSentByApi: false })
+    expect(response.body).toMatchObject({ status: 'ignored' })
+    expect(h.state.upsertCalls.length).toBe(0)
+    expect(h.dispatchInboundToAiReply).not.toHaveBeenCalled()
+  })
+
+  it('ignores group messages', async () => {
+    // The group jid is not a phone number, but normalizePhone cannot
+    // tell — processing it would mint a phantom contact.
+    const response = await runWebhook({
+      isGroup: true,
+      chatid: '120363123456789012@g.us',
+    })
+    expect(response.body).toMatchObject({ status: 'ignored' })
+    expect(h.state.upsertCalls.length).toBe(0)
+  })
+
+  it('ignores an event with no messageid, which would break idempotency', async () => {
+    // A NULL message_id never conflicts on the unique index, so every
+    // retry of this delivery would insert again and replay the fan-out.
+    const response = await runWebhook({ messageid: '' })
+    expect(response.body).toMatchObject({ status: 'ignored' })
     expect(h.state.upsertCalls.length).toBe(0)
   })
 

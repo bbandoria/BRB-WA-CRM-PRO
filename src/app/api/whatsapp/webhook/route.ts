@@ -92,9 +92,24 @@ export async function POST(request: Request) {
     return NextResponse.json({ status: 'ignored' }, { status: 200 })
   }
 
-  // Skip echoes of messages the app itself sent via the API — those
-  // are already persisted at send time (send-message.ts).
-  if (body.message.fromMe && body.message.wasSentByApi) {
+  // Three classes of event that must never become a customer message:
+  //
+  //  - `fromMe`: anything sent BY the connected number. When
+  //    `wasSentByApi` it's an echo of our own send (already persisted by
+  //    send-message.ts); when not, the owner typed it on the phone
+  //    itself. Neither is inbound, and treating either as one stores it
+  //    as sender_type='customer', bumps unread, and fires flows /
+  //    automations / AI auto-reply — i.e. the CRM answering itself.
+  //  - `isGroup`: the sender jid of a group event is the group's own
+  //    `...@g.us` id, which normalizePhone cannot tell apart from a
+  //    phone number. That mints a phantom contact, and an AI auto-reply
+  //    would then be sent privately to the wrong party.
+  //  - missing `messageid`: message_id would be written NULL, and NULL
+  //    never conflicts on the (conversation_id, message_id) unique
+  //    index — so the idempotent upsert silently stops being idempotent
+  //    and every webhook retry would duplicate the message and replay
+  //    the whole fan-out.
+  if (body.message.fromMe || body.message.isGroup || !body.message.messageid) {
     return NextResponse.json({ status: 'ignored' }, { status: 200 })
   }
 
